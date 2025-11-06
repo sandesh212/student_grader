@@ -1,6 +1,100 @@
 import os
 import re
 from docx import Document
+import openpyxl
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+
+# ---------- heuristics (structure first, minimal keywords) ----------
+
+def load_units_from_excel(excel_path='Units.xlsx'):
+    """
+    Load unit codes and descriptions from Units.xlsx.
+    Returns a list of tuples: [(unit_code, description), ...]
+    """
+    units = []
+    try:
+        wb = openpyxl.load_workbook(excel_path)
+        ws = wb.active
+        for row in ws.iter_rows(values_only=True):
+            if row[0] and row[1]:  # Both unit code and description must exist
+                units.append((str(row[0]).strip(), str(row[1]).strip()))
+        wb.close()
+    except Exception as e:
+        print(f"Warning: Could not load units from {excel_path}: {e}")
+    return units
+
+def classify_questions_to_units(questions, units, threshold=0.1):
+    """
+    Match multiple questions to the most relevant units based on text similarity.
+    More efficient than calling classify_question_to_unit repeatedly as it
+    fits the vectorizer only once.
+    
+    Args:
+        questions: List of question texts to classify
+        units: List of (unit_code, description) tuples
+        threshold: Minimum similarity score (0-1) to return a match
+    
+    Returns:
+        List of tuples (unit_code, description, similarity_score) or None for each question
+    """
+    if not units or not questions:
+        return [None] * len(questions)
+    
+    results = []
+    
+    try:
+        # Prepare unit descriptions
+        unit_descriptions = [desc for code, desc in units]
+        
+        # Fit vectorizer on unit descriptions
+        vectorizer = TfidfVectorizer(stop_words='english', lowercase=True)
+        unit_vecs = vectorizer.fit_transform(unit_descriptions)
+        
+        # Process each question
+        for question_text in questions:
+            if not question_text:
+                results.append(None)
+                continue
+                
+            # Transform question using fitted vectorizer
+            question_vec = vectorizer.transform([question_text])
+            
+            # Calculate cosine similarity
+            similarities = cosine_similarity(question_vec, unit_vecs)[0]
+            
+            # Find the best match
+            best_idx = np.argmax(similarities)
+            best_score = similarities[best_idx]
+            
+            if best_score >= threshold:
+                unit_code, unit_desc = units[best_idx]
+                results.append((unit_code, unit_desc, best_score))
+            else:
+                results.append(None)
+                
+    except Exception as e:
+        print(f"Warning: Error in unit classification: {e}")
+        results = [None] * len(questions)
+    
+    return results
+
+def classify_question_to_unit(question_text, units, threshold=0.1):
+    """
+    Match a question to the most relevant unit based on text similarity.
+    For batch processing, use classify_questions_to_units instead for better efficiency.
+    
+    Args:
+        question_text: The question to classify
+        units: List of (unit_code, description) tuples
+        threshold: Minimum similarity score (0-1) to return a match
+    
+    Returns:
+        Tuple of (unit_code, description, similarity_score) or None if no match
+    """
+    results = classify_questions_to_units([question_text], units, threshold)
+    return results[0] if results else None
 
 # ---------- heuristics (structure first, minimal keywords) ----------
 
@@ -277,13 +371,35 @@ def main():
         return
 
     print(f"Processing: {path}\n")
+    
+    # Load units from Excel file
+    print("Loading training units from Units.xlsx...")
+    units = load_units_from_excel()
+    if units:
+        print(f"Loaded {len(units)} training units.\n")
+    else:
+        print("Warning: No units loaded. Unit classification will be skipped.\n")
+    
     heads, qs, instr, reds = extract_and_classify_blocks(path)
 
+    # Classify questions to units (batch processing for efficiency)
+    question_classifications = []
+    if units and qs:
+        print("Classifying questions to training units...\n")
+        question_classifications = classify_questions_to_units(qs, units)
+
     print("=" * 60)
-    print("IDENTIFIED QUESTIONS")
+    print("IDENTIFIED QUESTIONS WITH UNIT CLASSIFICATION")
     print("=" * 60)
     for i, q in enumerate(qs, 1):
-        print(f"{i}. {q}\n")
+        print(f"{i}. {q}")
+        # Safe index access
+        if question_classifications and i-1 < len(question_classifications) and question_classifications[i-1]:
+            unit_code, unit_desc, score = question_classifications[i-1]
+            print(f"   → Unit: {unit_code} - {unit_desc}")
+            print(f"   → Confidence: {score:.2%}\n")
+        else:
+            print(f"   → Unit: Not classified\n")
 
     print("\n" + "=" * 60)
     print("INSTRUCTIONS")
