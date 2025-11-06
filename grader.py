@@ -1,6 +1,70 @@
 import os
 import re
 from docx import Document
+import openpyxl
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+
+# ---------- heuristics (structure first, minimal keywords) ----------
+
+def load_units_from_excel(excel_path='Units.xlsx'):
+    """
+    Load unit codes and descriptions from Units.xlsx.
+    Returns a list of tuples: [(unit_code, description), ...]
+    """
+    units = []
+    try:
+        wb = openpyxl.load_workbook(excel_path)
+        ws = wb.active
+        for row in ws.iter_rows(values_only=True):
+            if row[0] and row[1]:  # Both unit code and description must exist
+                units.append((str(row[0]).strip(), str(row[1]).strip()))
+        wb.close()
+    except Exception as e:
+        print(f"Warning: Could not load units from {excel_path}: {e}")
+    return units
+
+def classify_question_to_unit(question_text, units, threshold=0.1):
+    """
+    Match a question to the most relevant unit based on text similarity.
+    
+    Args:
+        question_text: The question to classify
+        units: List of (unit_code, description) tuples
+        threshold: Minimum similarity score (0-1) to return a match
+    
+    Returns:
+        Tuple of (unit_code, description, similarity_score) or None if no match
+    """
+    if not units or not question_text:
+        return None
+    
+    # Prepare texts for comparison
+    unit_descriptions = [desc for code, desc in units]
+    all_texts = unit_descriptions + [question_text]
+    
+    # Use TF-IDF vectorization for text similarity
+    try:
+        vectorizer = TfidfVectorizer(stop_words='english', lowercase=True)
+        tfidf_matrix = vectorizer.fit_transform(all_texts)
+        
+        # Calculate cosine similarity between question and all units
+        question_vec = tfidf_matrix[-1]
+        unit_vecs = tfidf_matrix[:-1]
+        similarities = cosine_similarity(question_vec, unit_vecs)[0]
+        
+        # Find the best match
+        best_idx = np.argmax(similarities)
+        best_score = similarities[best_idx]
+        
+        if best_score >= threshold:
+            unit_code, unit_desc = units[best_idx]
+            return (unit_code, unit_desc, best_score)
+    except Exception as e:
+        print(f"Warning: Error in unit classification: {e}")
+    
+    return None
 
 # ---------- heuristics (structure first, minimal keywords) ----------
 
@@ -277,13 +341,36 @@ def main():
         return
 
     print(f"Processing: {path}\n")
+    
+    # Load units from Excel file
+    print("Loading training units from Units.xlsx...")
+    units = load_units_from_excel()
+    if units:
+        print(f"Loaded {len(units)} training units.\n")
+    else:
+        print("Warning: No units loaded. Unit classification will be skipped.\n")
+    
     heads, qs, instr, reds = extract_and_classify_blocks(path)
 
+    # Classify questions to units
+    question_classifications = []
+    if units and qs:
+        print("Classifying questions to training units...\n")
+        for q in qs:
+            classification = classify_question_to_unit(q, units)
+            question_classifications.append(classification)
+
     print("=" * 60)
-    print("IDENTIFIED QUESTIONS")
+    print("IDENTIFIED QUESTIONS WITH UNIT CLASSIFICATION")
     print("=" * 60)
     for i, q in enumerate(qs, 1):
-        print(f"{i}. {q}\n")
+        print(f"{i}. {q}")
+        if i <= len(question_classifications) and question_classifications[i-1]:
+            unit_code, unit_desc, score = question_classifications[i-1]
+            print(f"   → Unit: {unit_code} - {unit_desc}")
+            print(f"   → Confidence: {score:.2%}\n")
+        else:
+            print(f"   → Unit: Not classified\n")
 
     print("\n" + "=" * 60)
     print("INSTRUCTIONS")
