@@ -23,8 +23,17 @@ build/
 Thumbs.db
 
 # Project specific
-*.docx
-samples/*.docx
+# Keep build artefacts out of git
 output/
-*.txt
-!requirements.txt
+
+# Allow sample documents and cached unit data to be committed
+#! If you want to exclude DOCX later, uncomment the next two lines
+#!*.docx
+#!samples/*.docx
+
+# Do not ignore generic *.txt so unit_cache/*.txt and other data files are tracked
+#!*.txt
+
+# Environment files (if used)
+.env
+.env.*

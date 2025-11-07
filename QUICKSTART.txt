@@ -1,0 +1,69 @@
+╔══════════════════════════════════════════════════════════════════════╗
+║                    STUDENT GRADER - QUICK START                      ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+📍 CURRENT STATUS
+  ✅ System is FULLY OPERATIONAL
+  ✅ 129 units loaded from cache
+  ✅ 8 sample files ready to process
+  ✅ Fast processing (< 1 second per file)
+
+🚀 HOW TO USE (Choose one)
+
+  Option 1: EASY WAY
+    cd /Users/sandeshkumar/Downloads/student_grader
+    ./run_grader.sh
+
+  Option 2: MANUAL WAY
+    cd /Users/sandeshkumar/Downloads/student_grader
+    venv/bin/python grader_complete.py
+
+📝 WHEN IT ASKS FOR FILENAME
+
+  • Press ENTER → Process ALL sample files
+  • Type filename → Process one file (e.g., "Knowledge-Seamanship.docx")
+
+✨ WHAT YOU GET
+
+  For each question:
+    • Question text
+    • Extracted answers (if available)
+    • Mapped unit codes (MARK007, MARN008, etc.)
+    • Confidence scores
+
+📊 AVAILABLE SCRIPTS
+
+  1. grader_complete.py ⭐ RECOMMENDED
+     → Fast, complete, auto-finds marking sheets
+
+  2. grader_fast.py
+     → Quick extraction, unit mapping
+
+  3. grader.py (AI version)
+     → Slow but handles complex documents
+
+🔧 YOUR SETUP
+
+  Location: /Users/sandeshkumar/Downloads/student_grader
+  Python: Virtual environment (venv/)
+  Units: 129 loaded from unit_cache/
+  Samples: 8 files in samples/
+
+💡 TIPS
+
+  • Files with "Marking Sheet" in name = answers
+  • Questions need unit codes (K007, N008) for mapping
+  • Red text in documents = model answers
+  • Batch process saves time
+
+📚 DOCUMENTATION
+
+  • STATUS.md         - Detailed system status
+  • SOLUTION_SUMMARY.md - Complete solution overview
+  • README.md         - Project information
+
+═══════════════════════════════════════════════════════════════════════
+
+Ready to use! Just run: ./run_grader.sh
+
+═══════════════════════════════════════════════════════════════════════

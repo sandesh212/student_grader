@@ -1,307 +1,261 @@
 import os
 import re
+import json
 from docx import Document
+try:
+    from openai import OpenAI
+except ImportError:
+    print("OpenAI library not found. Please run 'pip install openai'")
+    exit()
 
-# ---------- heuristics (structure first, minimal keywords) ----------
+# --- AI Configuration ---
+# This script is configured to use a local Ollama model.
+# Make sure the Ollama application is running on your Mac.
+client = OpenAI(
+    base_url='http://localhost:11434/v1',
+    api_key='ollama'  # required, but unused by Ollama
+)
+AI_MODEL = "phi3:mini" # Using a lightweight model for speed.
 
-def is_heading(block: str) -> bool:
-    text = block.strip()
-    if not text:
-        return False
-    low = text.lower()
-    # Labeled section headers
-    if re.match(r'^(part|section)\s+[a-z0-9]+$', low):
-        return True
-    # Short ALL CAPS line
-    if text.isupper() and 5 <= len(text) <= 60:
-        return True
-    return False
+# ---------- RULE-BASED HEURISTICS (for speed) ----------
 
 def is_question_block(block: str) -> bool:
     """
-    Structural signals only:
-    - Starts with numbering (1., 1.1., 3), a), i) …)
-    - Ends with a question mark
-    - Contains fill-in patterns (____, …)
+    A quick check to see if a block might be a question.
+    This is used to prevent instructions from being misclassified as questions.
     """
     t = block.strip()
-    if not t:
-        return False
-
+    if not t: return False
     first = t.splitlines()[0].strip()
-
     # Numbering patterns
-    if re.match(r'^(\d+(?:\.\d+)*[.)]|\d+\.)\s+', first):
-        return True
-    if re.match(r'^([a-z]\)|\([a-z]\)|[ivxlcdm]+\))\s+', first, re.IGNORECASE):
-        return True
-    
-    # Question mark anywhere
-    if '?' in t:
-        return True
-    
-    # Fill-in blanks
-    if re.search(r'_{3,}|\.\.\.|_____', t):
-        return True
-
-    # ADDED: Directive verbs that indicate questions
-    if re.search(r'\b(list|describe|name|state|explain|identify|give|provide|calculate)\b', first.lower()):
-        return True
-
+    if re.match(r'^(\d+(?:\.\d+)*[.)]|\d+\.)\s+', first): return True
+    if re.match(r'^([a-z]\)|\([a-z]\)|[ivxlcdm]+\))\s+', first, re.IGNORECASE): return True
+    # Question mark or directive verbs
+    if '?' in t: return True
+    if re.search(r'\b(list|describe|name|state|explain|identify|give|provide|calculate|fill in|match)\b', first.lower()): return True
     return False
 
 def is_instruction(block: str) -> bool:
     """
-    Administrative/meta text about the assessment process.
+    Fast, rule-based check for instruction text.
     """
     t = block.strip()
-    if not t:
+    if not t or is_question_block(t):
         return False
+    
     low = t.lower()
-
-    # IMPORTANT: Don't classify questions as instructions
-    if is_question_block(t):
-        return False
-
-    # Strong admin indicators (expanded list)
-    admin = [
+    # Keywords that strongly indicate instructions
+    admin_keywords = [
         r'\bassessor', r'\bparticipant', r'\bmarking', r'\bcriteria',
-        r'\bmodel answer', r'\bsatisfactory response', r'\blog\b',
-        r'\bdocument the\b', r'\brefer to\b', r'\bindicate whether\b',
-        r'\bcourse participant', r'\bmarking sheet\b', r'\btechnically correct\b',
-        r'\bacceptable responses\b', r'\blevel of detail\b', r'\bminimum required\b',
-        r'\bbasic level of knowledge\b', r'\bmust be completed\b', r'\binitial next to it\b',
-        r'\banswers within this', r'\blisted below are', r'\bmust refer to these\b'
+        r'\bmodel answer', r'\bsatisfactory response', r'\btechnically correct\b',
+        r'\bacceptable responses\b', r'\bmust be completed\b', r'trainer.*assessor.*instruction'
     ]
-    if any(re.search(p, low) for p in admin):
-        return True
-
-    # Check for bullet point structure (multiple lines starting with bullets)
-    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
-    
-    # Count lines that start with bullet markers
-    bullet_count = sum(1 for ln in lines if re.match(r'^[•\-\*]\s+', ln))
-    
-    # If 3+ bullet points, it's likely an instruction list
-    if bullet_count >= 3:
+    if any(re.search(p, low) for p in admin_keywords):
         return True
     
-    # If 2+ bullets AND contains admin keywords
-    if bullet_count >= 2 and any(re.search(p, low) for p in admin[:5]):
-        return True
-
-    # Header-like instruction (but only if NOT a question)
-    if lines:
-        first = lines[0]
-        if first.endswith(':') and not re.search(r'\b(list|describe|name|state|explain)\b', first.lower()):
-            return True
-
     return False
 
-# ---------- text extraction helpers ----------
+# ---------- AI CLASSIFICATION (for accuracy) ----------
 
-def extract_red_and_black_text(cell):
+def classify_remaining_with_ai(text_block: str):
     """
-    Return (red_fragments, black_text_with_newlines)
+    Uses AI to classify text that is NOT an instruction.
     """
-    red = []
-    black_parts = []
+    system_prompt = """
+    You are an expert document analysis assistant. Your task is to classify a block of text that has already been determined NOT to be an instruction.
+    Classify it and extract its contents into a structured JSON format.
 
-    for p in cell.paragraphs:
-        para_parts = []
-        for run in p.runs:
-            txt = run.text or ''
-            if not txt:
-                continue
-            is_red = False
-            try:
-                color = getattr(run.font, "color", None)
-                rgb = getattr(color, "rgb", None)
-                if rgb is not None:
-                    # Accept any representation containing FF0000
-                    if "FF0000" in str(rgb).upper():
-                        is_red = True
-            except Exception:
-                pass
+    The possible classifications for the 'type' field are:
+    1.  'heading': A major section title (e.g., "Part A – Emergency preparedness").
+    2.  'question_with_answers': A block containing BOTH a question and its corresponding answers.
+    3.  'other': Any text that doesn't fit the above categories (e.g., page footers).
 
-            if is_red:
-                if txt.strip():
-                    red.append(txt.strip())
-            else:
-                para_parts.append(txt)
-        # preserve paragraph boundaries
-        if para_parts:
-            black_parts.append("".join(para_parts))
-        # even if no non-red in this paragraph, keep a newline to avoid merging
-        black_parts.append("\n")
-
-    black_text = "".join(black_parts).replace("\r\n", "\n")
-    # Collapse multiple blank lines
-    black_text = re.sub(r'\n{3,}', '\n\n', black_text).strip()
-    return red, black_text
-
-# ---------- splitting logic (prevents merging) ----------
-
-def split_into_question_blocks(text: str):
+    You MUST return a single JSON object with two keys: 'type' and 'content'.
+    - For 'heading' or 'other', the 'content' should be a single string.
+    - For 'question_with_answers', the 'content' MUST be a JSON object with two keys: 'question' (a string) and 'answers' (an array of strings).
     """
-    Normalize and split into atomic question blocks.
-    DON'T split bullet-pointed instruction blocks.
-    """
-    if not text:
-        return []
 
-    # First check: if this looks like a multi-line bullet instruction block, keep it whole
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    bullet_count = sum(1 for ln in lines if re.match(r'^[•\-\*]\s+', ln))
-    
-    # If 3+ bullets in the whole text, treat as single instruction block
-    if bullet_count >= 3:
-        return [text.strip()]
-
-    s = text
-
-    # Force newlines before markers that might appear mid-line
-    s = re.sub(r'(?i)(?<!\n)(\b\d+(?:\.\d+)*[.)]|\b\d+\.)\s+', r'\n\1 ', s)
-    s = re.sub(r'(?i)(?<!\n)(\b[a-z]\)|\([a-z]\)|\b[ivxlcdm]+\))\s+', r'\n\1 ', s)
-
-    # Split after question marks if there is more content following
-    s = re.sub(r'\?\s*(?=\S)', '?\n', s)
-
-    # Split by lines, then group into blocks that start with a marker or contain a '?'
-    lines = [ln.strip() for ln in s.split('\n') if ln.strip()]
-
-    def is_start_marker(line: str) -> bool:
-        return bool(
-            re.match(r'^(\d+(?:\.\d+)*[.)]|\d+\.)\s+', line) or
-            re.match(r'^([a-z]\)|\([a-z]\)|[ivxlcdm]+\))\s+', line, re.IGNORECASE)
+    try:
+        print(f"\nAI_INFO: Analyzing block: \"{text_block[:85].replace(os.linesep, ' ')}...\"")
+        response = client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text_block}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0,
         )
+        result_str = response.choices[0].message.content
+        result_json = json.loads(result_str)
+        
+        if 'type' in result_json and 'content' in result_json:
+            print(f"AI_INFO: Classified as '{result_json['type']}'.")
+            return result_json
+        else:
+            print("AI_WARNING: AI response was not in the expected format.")
+            return None
+    except Exception as e:
+        print(f"AI_ERROR: An error occurred during AI analysis: {e}")
+        print("AI_HINT: Is the Ollama application running on your Mac?")
+        return None
 
+# ---------- DOCUMENT PROCESSING (Hybrid Logic) ----------
+
+def create_logical_blocks(doc):
+    """
+    Groups paragraphs and table content into logical blocks, preserving document order.
+    """
     blocks = []
-    cur = []
+    current_block_lines = []
 
-    for ln in lines:
-        if is_start_marker(ln) or ln.endswith('?'):
-            # start a new block
-            if cur:
-                blocks.append("\n".join(cur).strip())
-            cur = [ln]
-        else:
-            cur.append(ln)
+    def flush_current_block():
+        """Helper to add the current block to the list and reset."""
+        if current_block_lines:
+            blocks.append("\n".join(current_block_lines))
+            current_block_lines.clear()
 
-    if cur:
-        blocks.append("\n".join(cur).strip())
+    # Create mappings from the underlying XML element to the python-docx object.
+    # This is an efficient way to look up the wrapper object.
+    para_map = {p._p: p for p in doc.paragraphs}
+    table_map = {t._tbl: t for t in doc.tables}
 
-    # Post-process: if a block contains multiple questions (multiple '?'),
-    # split them further to keep one question per block.
-    final_blocks = []
-    for b in blocks:
-        parts = re.split(r'(\?)', b)
-        if parts.count('?') <= 1:
-            final_blocks.append(b)
-        else:
-            # Recombine text so each piece ending with '?' is its own block
-            acc = ""
-            for seg in parts:
-                acc += seg
-                if seg == '?':
-                    final_blocks.append(acc.strip())
-                    acc = ""
-            if acc.strip():
-                final_blocks.append(acc.strip())
-
-    # Remove tiny fragments that are clearly not questions/headers
-    final_blocks = [blk for blk in final_blocks if len(blk) >= 2]
-
-    return final_blocks
-
-# ---------- classification pipeline ----------
-
-def normalize_block_key(block: str) -> str:
-    return re.sub(r'[\s,.;:!?\-]+', '', block.lower())
-
-def extract_and_classify_blocks(docx_path):
-    doc = Document(docx_path)
-
-    headings, questions, instructions, red_texts = [], [], [], []
-    seen_h, seen_q, seen_i = set(), set(), set()
-
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                reds, black = extract_red_and_black_text(cell)
-                red_texts.extend(reds)
-
-                if not black:
+    # Iterate through the direct children of the document's body element.
+    # This is the crucial step to preserve the order of paragraphs and tables.
+    for body_child_element in doc.element.body:
+        # Check if the element is a paragraph
+        if body_child_element.tag.endswith('p'):
+            para = para_map.get(body_child_element)
+            if para:
+                text = para.text.strip()
+                if not text:
                     continue
+                
+                # Heuristic: Start a new block for major sections or new numbered items.
+                is_new_block_start = re.match(r'^(Part\s+[A-Z]|Section\s+[A-Z]|\d+\.\s)', text)
+                if is_new_block_start and current_block_lines:
+                    flush_current_block()
+                
+                current_block_lines.append(text)
 
-                # Split cell text into atomic blocks BEFORE classifying
-                for block in split_into_question_blocks(black):
-                    key = normalize_block_key(block)
-                    if not key:
-                        continue
+        # Check if the element is a table
+        elif body_child_element.tag.endswith('tbl'):
+            table = table_map.get(body_child_element)
+            if table:
+                # A table is a distinct logical unit. Flush any preceding paragraph block.
+                flush_current_block()
+                
+                # Extract all text from the table as a single, self-contained block.
+                table_lines = []
+                for row in table.rows:
+                    for cell in row.cells:
+                        for para_in_cell in cell.paragraphs:
+                            cell_text = para_in_cell.text.strip()
+                            if cell_text:
+                                table_lines.append(cell_text)
+                if table_lines:
+                    blocks.append("\n".join(table_lines))
 
-                    # FIXED ORDER: heading -> question -> instruction
-                    # (questions must be checked BEFORE instructions!)
-                    if is_heading(block):
-                        if key not in seen_h:
-                            headings.append(block)
-                            seen_h.add(key)
-                        continue
+    # Add any remaining lines from the very last block in the document.
+    flush_current_block()
+    return blocks
 
-                    if is_question_block(block):
-                        if key not in seen_q:
-                            questions.append(block)
-                            seen_q.add(key)
-                        continue
+def process_document_hybrid(docx_path):
+    """
+    Processes the document using a hybrid rule-based and AI approach.
+    """
+    try:
+        doc = Document(docx_path)
+    except Exception as e:
+        print(f"ERROR: Could not open or read DOCX file: {e}")
+        return [], [], []
 
-                    if is_instruction(block):
-                        if key not in seen_i:
-                            instructions.append(block)
-                            seen_i.add(key)
-                        continue
+    headings, instructions, questions = [], [], []
+    logical_blocks = create_logical_blocks(doc)
 
-                    # If none matched, ignore
+    for block_text in logical_blocks:
+        # Fast path: Use rules to identify instructions first.
+        if is_instruction(block_text):
+            print(f"\nRULE_INFO: Classified as 'instruction'.")
+            instructions.append(block_text)
+            continue
 
-    return headings, questions, instructions, red_texts
+        # Slow path: If not an instruction, use AI for accurate classification.
+        ai_result = classify_remaining_with_ai(block_text)
+        if not ai_result: continue
 
-# ---------- CLI ----------
+        result_type = ai_result.get('type')
+        content = ai_result.get('content')
+
+        if result_type == 'heading':
+            headings.append(content)
+        elif result_type == 'question_with_answers':
+            if isinstance(content, dict) and 'question' in content and 'answers' in content:
+                questions.append(content)
+            else:
+                print(f"AI_WARNING: 'question_with_answers' block has malformed content: {content}")
+
+    return headings, instructions, questions
+
+# ---------- MAIN EXECUTION ----------
 
 def main():
     doc_filename = input("Enter DOCX filename (just file, no path): ").strip()
-    if os.path.isfile(doc_filename):
-        path = doc_filename
-    elif os.path.isfile(os.path.join("samples", doc_filename)):
-        path = os.path.join("samples", doc_filename)
+    path_in_cwd = os.path.join(os.getcwd(), doc_filename)
+    path_in_samples = os.path.join(os.getcwd(), "samples", doc_filename)
+
+    if os.path.isfile(path_in_cwd):
+        path = path_in_cwd
+    elif os.path.isfile(path_in_samples):
+        path = path_in_samples
     else:
-        print(f"ERROR: File '{doc_filename}' not found in CWD or samples/.")
+        print(f"ERROR: File '{doc_filename}' not found in current directory or in a 'samples' subdirectory.")
         return
 
-    print(f"Processing: {path}\n")
-    heads, qs, instr, reds = extract_and_classify_blocks(path)
+    print(f"\nProcessing '{os.path.basename(path)}' using hybrid AI model: '{AI_MODEL}'...")
+    
+    headings, instructions, questions = process_document_hybrid(path)
 
-    print("=" * 60)
-    print("IDENTIFIED QUESTIONS")
-    print("=" * 60)
-    for i, q in enumerate(qs, 1):
-        print(f"{i}. {q}\n")
+    print("\n" + "=" * 80)
+    print("QUESTIONS WITH ANSWERS")
+    print("=" * 80)
+    if not questions:
+        print("No questions were identified.")
+    for i, item in enumerate(questions, 1):
+        print(f"\n{i}. QUESTION:")
+        print(f"   {item['question']}")
+        if item['answers']:
+            print(f"\n   ANSWERS:")
+            for j, ans in enumerate(item['answers'], 1):
+                if ans.strip(): print(f"   {j}) {ans.strip()}")
+        else:
+            print(f"\n   ⚠️  WARNING: No answers were extracted for this question!")
+        print("-" * 80)
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 80)
     print("INSTRUCTIONS")
-    print("=" * 60)
-    for i, ins in enumerate(instr, 1):
+    print("=" * 80)
+    if not instructions:
+        print("No instructions were identified.")
+    for i, ins in enumerate(instructions, 1):
         print(f"{i}. {ins}\n")
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 80)
     print("HEADINGS")
-    print("=" * 60)
-    for i, h in enumerate(heads, 1):
+    print("=" * 80)
+    if not headings:
+        print("No headings were identified.")
+    for i, h in enumerate(headings, 1):
         print(f"{i}. {h}\n")
-
-    print("\n" + "=" * 60)
-    print("RED TEXT (ANSWERS)")
-    print("=" * 60)
-    for i, r in enumerate(reds, 1):
-        print(f"{i}. {r}")
+    
+    total_questions = len(questions)
+    questions_with_answers = sum(1 for q in questions if q['answers'])
+    print("\n" + "=" * 80)
+    print("SUMMARY")
+    print("=" * 80)
+    print(f"Total Questions Identified: {total_questions}")
+    print(f"Questions with Answers: {questions_with_answers}")
+    print(f"Questions WITHOUT Answers: {total_questions - questions_with_answers}")
 
 if __name__ == "__main__":
     main()
